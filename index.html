@@ -83,6 +83,10 @@
   .toggles span { display: inline-block; width: 34px; padding: 5px 0; text-align: center; border-radius: 6px; background: var(--line); cursor: pointer; }
   .toggles input:checked + span { background: var(--accent); color: #fff; }
   menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; margin: 12px 0 0; }
+  .cellid { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .cellid input { width: 160px; }
+  dialog h3 { font-size: 15px; margin: 8px 0 6px; }
+  dialog h3 small, dialog td small { color: var(--dim); font-weight: 400; }
   figure { margin: 0 0 10px; }
   figcaption { font-size: 12px; color: var(--dim); display: flex; justify-content: space-between; }
   figure svg { width: 100%; height: 90px; background: var(--bg); border-radius: 6px; }
@@ -92,13 +96,20 @@
 <header>
   <h1>A8 Chargers</h1>
   <button id="add" class="primary">Add charger</button>
+  <button id="cellsBtn">Cells</button>
   <button id="setSlots" disabled>Set slots…</button>
 </header>
 <p class="note" id="note">Tap <b>Add charger</b> and pick one charger from the list; repeat for each. The list shows Bluetooth names (like “0000A8Air C0C”), not your names. Quit ISD Link and the A8 Chargers app (Mac and iPhone) first: each charger takes one connection at a time.</p>
 <main id="grid"></main>
 <p class="note">Each slot: charge · volts · mA · mAh · IR mΩ, then its settings. Click a slot for everything.</p>
 
-<dialog id="detail"><div id="detailBody"></div><form method="dialog"><menu><button class="primary">Done</button></menu></form></dialog>
+<dialog id="detail">
+  <h2 id="detailTitle"></h2>
+  <label class="cellid">Cell ID <input id="cellInput" placeholder="e.g. EP-07" maxlength="20" autocomplete="off"></label>
+  <div id="detailBody"></div>
+  <form method="dialog"><menu><button class="primary">Done</button></menu></form>
+</dialog>
+<dialog id="cells"><h2>Cells</h2><div id="cellsBody"></div><form method="dialog"><menu><button class="primary">Done</button></menu></form></dialog>
 
 <dialog id="bulk"><form method="dialog" id="bulkForm">
   <h2>Set slots</h2>
@@ -120,6 +131,7 @@
 
 <script>
 "use strict";
+const demo = location.hash === "#demo";
 // ---- Protocol (verified against real chargers, FW 2.2; same as a8air.py / Protocol.swift) ----
 const SVC = 0xaf00, AF01 = 0xaf01, AF02 = 0xaf02;
 // Sent in the bind handshake; the A8 Air accepts any ID (no pairing button). Same as the app.
@@ -180,12 +192,18 @@ function slotColor(s) {
   const t = (level(s) - 80) / 20;
   return `hsl(130 ${60 + 40 * t}% ${68 - 28 * t}%)`;
 }
-/** IR bands: under 200 mΩ green, under 300 blue, under 400 red, 400 and up bright red. */
-function irColor(s) {
+/** Drift of the comparable IR against the cell's baseline: under 25 % green, 25–50 % amber, 50 % and up red. */
+const driftColor = d => d < 25 ? "var(--green)" : d < 50 ? "#ff9f0a" : "var(--red)";
+/** IR colour. A labeled cell with a baseline is coloured by drift; other cells use the fixed bands:
+    under 200 mΩ green, under 300 blue, under 400 red, 400 and up bright red. */
+function irColor(s, drift = null) {
   if (s.irRaw === 0) return "var(--dim)";
+  if (drift != null) return driftColor(drift);
   const ir = s.irRaw / 10;  // 0.1 mΩ units
   return ir < 200 ? "var(--green)" : ir < 300 ? "var(--blue)" : ir < 400 ? "var(--irred)" : "var(--irbright)";
 }
+const irBad = (s, drift) => drift != null ? drift >= 25 : s.irRaw >= 3000;  // bold when the colour is a warning
+const mOhm = v => v == null ? "–" : v.toFixed(1) + " mΩ";
 const chemName = c => CHEM[c]?.name ?? `Type ${c}`;
 const volts = mV => (mV / 1000).toFixed(2) + " V";
 const currentLabel = mA => mA === 0 ? "Auto current" : `${mA} mA`;
@@ -200,7 +218,8 @@ const blank = () => ({ state: 0, percent: 0, mAh: 0, mWh: 0, seconds: 0, chem: 6
 function newCharger(id, name) {
   const ch = { id, name, online: false, status: "Connecting…", fw: "", inMV: 0, inMA: 0,
                slots: Array.from({ length: 8 }, blank), tasks: Array.from({ length: 8 }, () => ({ task: 0, chem: 6, mA: 0, cutoff: 0, cap: 0 })),
-               history: Array.from({ length: 8 }, () => []), rejected: new Set(), queue: Promise.resolve() };
+               tracks: Array.from({ length: 8 }, () => ({ history: [], irStart: null, irEnd: null })), cells: loadCells(id),
+               rejected: new Set(), queue: Promise.resolve() };
   chargers.set(id, ch);
   return ch;
 }
@@ -226,7 +245,7 @@ function onData(ch, b) {
   } else if (b[0] === 0x31) {
     switch (b[1]) {
       case 0xe5: if (b.length >= 9) { ch.inMV = le(b, 3, 2); ch.inMA = le(b, 5, 4); } break;
-      case 0xe7: { const s = parseSlots(b); if (s?.length === 8) updateSlots(ch, s); } break;
+      case 0xe7: { const s = parseSlots(b); if (s?.length === 8) updateSlots(ch, s).forEach(i => recordCharge(ch, i)); } break;
       case 0xed: { const t = parseTasks(b); if (t?.length === 8) ch.tasks = t; } break;
       case 0xeb: if (b.length >= 4 && b[3] !== 0) ch.rejected.add(b[2] + 1); break;
       case 0xc1:
@@ -238,19 +257,34 @@ function onData(ch, b) {
   scheduleRender();
 }
 
-function updateSlots(ch, slots) {
-  slots.forEach((s, i) => {
-    if (!isCharging(s)) return;
-    const h = ch.history[i], last = h.at(-1);
-    if (last && s.seconds < last.s) h.length = 0;  // a new charge started
+/** One slot's charge: graph history plus the two comparable IR readings. Same rules as ChargeTracker in the app.
+    Returns true when a charge just finished (charging → Done). */
+function trackUpdate(t, old, s) {
+  if (isCharging(s) && (!isCharging(old) || s.seconds < old.seconds)) Object.assign(t, { history: [], irStart: null, irEnd: null });
+  if (isCharging(s)) {
+    // irStart: first nonzero IR at ≥ 60 s; only within the first 2 min so joining a charge late can't record a non-comparable value.
+    if (t.irStart == null && s.irRaw > 0 && s.seconds >= 60 && s.seconds < 120) t.irStart = s.irRaw / 10;
     // ponytail: one point per 10 s keeps a 10 h charge at ~3600 points.
-    if (!h.length || s.seconds - h.at(-1).s >= 10) h.push({ s: s.seconds, v: s.mV / 1000, ma: s.mA, mah: s.mAh });
-  });
+    if (!t.history.length || s.seconds - t.history.at(-1).s >= 10) t.history.push({ s: s.seconds, v: s.mV / 1000, ma: s.mA, mah: s.mAh, ir: s.irRaw / 10 });
+  }
+  if (s.state !== 6 || !isCharging(old)) return false;
+  t.irEnd = s.irRaw > 0 ? s.irRaw / 10 : null;
+  return true;
+}
+
+/** Returns the slots whose charge just finished. */
+function updateSlots(ch, slots) {
+  const finished = slots.map((s, i) => trackUpdate(ch.tracks[i], ch.slots[i], s) ? i : -1).filter(i => i >= 0);
   ch.slots = slots;
+  return finished;
 }
 
 const saveName = ch => { try { localStorage.setItem("name:" + ch.id, ch.name); } catch {} };
 const loadName = id => { try { return localStorage.getItem("name:" + id); } catch { return null; } };
+function loadCells(id) {
+  try { const c = JSON.parse(localStorage.getItem("cells:" + id)); if (Array.isArray(c) && c.length === 8) return c; } catch {}
+  return Array(8).fill("");
+}
 
 // ---- Web Bluetooth ----
 async function attach(device) {
@@ -331,14 +365,14 @@ function scheduleRender() {
 }
 
 function slotHTML(ch, i) {
-  const s = ch.slots[i], t = ch.tasks[i], c = slotColor(s), lvl = level(s);
+  const s = ch.slots[i], t = ch.tasks[i], c = slotColor(s), lvl = level(s), cell = ch.cells[i], drift = cellStats(cell)?.drift ?? null;
   const sym = hasError(s) ? "!" : isCharging(s) ? "⚡" : "";
   const live = isEmpty(s)
     ? `<div class="pct" style="color:var(--dim)"><span class="u">Empty</span><span class="nu">–</span></div><div>&nbsp;</div><div>&nbsp;</div><div class="mah">&nbsp;</div><div>&nbsp;</div>`
     : `<div class="pct" style="color:${c}">${lvl}%</div><div class="v">${(s.mV / 1000).toFixed(2)}<span class="u"> V</span></div>
        <div>${s.mA}<span class="u"> mA</span></div><div class="mah">${s.mAh} mAh</div>
-       <div style="color:${irColor(s)};font-weight:${s.irRaw >= 3000 ? 700 : 400}">${s.irRaw ? (s.irRaw / 10).toFixed(0) : "–"}<span class="u"> mΩ</span></div>`;
-  return `<div class="slot" data-ch="${esc(ch.id)}" data-i="${i}"><div class="n">${i + 1}</div>
+       <div style="color:${irColor(s, drift)};font-weight:${irBad(s, drift) ? 700 : 400}">${s.irRaw ? (s.irRaw / 10).toFixed(0) : "–"}<span class="u"> mΩ</span></div>`;
+  return `<div class="slot" data-ch="${esc(ch.id)}" data-i="${i}"><div class="n">${i + 1}${cell ? ` · ${esc(cell)}` : ""}</div>
     <div class="bat${lvl === 100 ? " full" : ""}" style="--c:${c};--lvl:${lvl / 100}"><i></i><b>${sym}</b></div>${live}
     <hr><div class="pre"><b>${chemName(t.chem)}</b><br>${currentLabel(t.mA)}<br>${cutoffLabel(t)}<br>${capLabel(t)}</div></div>`;
 }
@@ -360,6 +394,7 @@ function render() {
   }).join("");
   document.getElementById("setSlots").disabled = !list.some(ch => ch.online);
   if (document.getElementById("detail").open) renderDetail();
+  if (document.getElementById("cells").open) renderCells();
 }
 
 // ---- Slot detail ----
@@ -371,17 +406,24 @@ function graph(title, h, key, color, digits) {
     <svg viewBox="0 -4 300 108" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></figure>`;
 }
 function renderDetail() {
-  const ch = chargers.get(detailRef.id), i = detailRef.i, s = ch.slots[i], t = ch.tasks[i], h = ch.history[i];
+  const ch = chargers.get(detailRef.id), i = detailRef.i, s = ch.slots[i], t = ch.tasks[i], tr = ch.tracks[i], h = tr.history;
+  const st = cellStats(ch.cells[i]);
+  const cellRows = [["IR at 1 min, this charge", mOhm(tr.irStart)], ["IR at finish, this charge", mOhm(tr.irEnd)]];
+  if (st) cellRows.push(["Logged charges", st.charges], ["Baseline", st.baseline != null ? mOhm(st.baseline) : `after 3 charges (${st.measured}/3)`],
+                        ["Last 1-min IR", mOhm(st.lastIRStart)]);
+  if (st?.drift != null) cellRows.push(["Change from baseline", `<b style="color:${driftColor(st.drift)}">${st.drift >= 0 ? "+" : ""}${st.drift.toFixed(0)} %</b>`]);
   const time = new Date(s.seconds * 1000).toISOString().slice(11, 19);
   const rows = [["State", isEmpty(s) ? "Empty" : STATES[s.state] ?? `State ${s.state}`], ["Chemistry", chemName(s.chem)],
     ["Voltage", (s.mV / 1000).toFixed(3) + " V"], ["Current", s.mA + " mA"], ["Charged", `${s.mAh} mAh · ${s.mWh} mWh`],
     ["Charge level", `<span style="color:${slotColor(s)}">${level(s)} %</span>`], ["Time", time],
-    ["Internal resistance", `<span style="color:${irColor(s)}">${(s.irRaw / 10).toFixed(1)} mΩ</span>`], ["Error code", s.error],
+    ["Internal resistance", `<span style="color:${irColor(s, st?.drift ?? null)}">${(s.irRaw / 10).toFixed(1)} mΩ</span>`], ["Error code", s.error],
     ["Preset chemistry", chemName(t.chem)], ["Preset current", currentLabel(t.mA)], ["Preset cutoff", cutoffLabel(t)], ["Capacity limit", capLabel(t)]];
-  document.getElementById("detailBody").innerHTML = `<h2>${esc(ch.name)} · slot ${i + 1}</h2>
+  document.getElementById("detailTitle").textContent = `${ch.name} · slot ${i + 1}`;
+  document.getElementById("detailBody").innerHTML = `<table>${cellRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</table>
     <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</table>
     ${h.length < 2 ? `<p class="note" style="margin:0">Graphs fill in while this page is open and the slot is charging.</p>`
-      : graph("Voltage (V)", h, "v", "var(--green)", 3) + graph("Current (mA)", h, "ma", "#ff9f0a", 0) + graph("Charged (mAh)", h, "mah", "var(--blue)", 0)}`;
+      : graph("Voltage (V)", h, "v", "var(--green)", 3) + graph("Current (mA)", h, "ma", "#ff9f0a", 0) + graph("Charged (mAh)", h, "mah", "var(--blue)", 0)
+        + graph("Internal resistance (mΩ)", h.filter(p => p.ir != null), "ir", "#bf5af2", 0)}`;
 }
 
 document.getElementById("grid").onclick = e => {
@@ -390,6 +432,7 @@ document.getElementById("grid").onclick = e => {
   const slot = e.target.closest(".slot");
   if (!slot) return;
   detailRef = { id: slot.dataset.ch, i: +slot.dataset.i };
+  document.getElementById("cellInput").value = chargers.get(detailRef.id).cells[detailRef.i];
   renderDetail();
   document.getElementById("detail").showModal();
   if (hub) hubRefresh();  // fetch this slot's graph data now
@@ -462,6 +505,100 @@ $("bulk").onclose = () => {
 // ---- Start ----
 setInterval(() => document.body.classList.toggle("dim"), 800);
 
+// ---- Cells: labels, charge log, baseline/drift, pairs (same rules as CellLog.swift in the app) ----
+const CSV_HEADER = "date,charger,slot,cellID,chemistry,mAh,irStart,irEnd,seconds";
+let logRows = [], logFetched = 0;  // standalone: kept in this browser; served by the Mac: the Mac's cells.csv
+if (!demo) try { logRows = JSON.parse(localStorage.getItem("cellLog")) || []; } catch {}
+
+const pad2 = n => String(n).padStart(2, "0");
+const stamp = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+
+function recordCharge(ch, i) {
+  const s = ch.slots[i], t = ch.tracks[i];
+  logRows.push({ date: stamp(), charger: ch.name, slot: i + 1, cellID: (ch.cells[i] || "").trim(), chemistry: chemName(s.chem),
+                 mAh: s.mAh, irStart: t.irStart, irEnd: t.irEnd, seconds: s.seconds });
+  if (!demo) try { localStorage.setItem("cellLog", JSON.stringify(logRows)); } catch {}
+}
+
+function setCell(ch, i, value) {
+  value = value.trim();
+  if (hub) return hubPost("api/label", { id: ch.id, slot: i + 1, cell: value });
+  ch.cells[i] = value;
+  if (!demo) try { localStorage.setItem("cells:" + ch.id, JSON.stringify(ch.cells)); } catch {}
+  scheduleRender();
+}
+
+/** Baseline = median irStart of the cell's first 3 logged charges; drift = latest irStart against it, in %. */
+function cellStats(id, rows = logRows) {
+  id = (id || "").trim();
+  const mine = rows.filter(r => r.cellID === id);
+  if (!id || !mine.length) return null;
+  const starts = mine.map(r => r.irStart).filter(v => v != null);
+  const baseline = starts.length >= 3 ? starts.slice(0, 3).sort((a, b) => a - b)[1] : null;
+  const lastIRStart = starts.length ? starts.at(-1) : null;
+  return { id, charges: mine.length, measured: starts.length, baseline, lastIRStart, lastMAh: mine.at(-1).mAh,
+           drift: baseline > 0 && lastIRStart != null ? (lastIRStart - baseline) / baseline * 100 : null };
+}
+/** Every labeled cell, lowest comparable IR first, then highest capacity. */
+const allCells = (rows = logRows) => [...new Set(rows.map(r => r.cellID).filter(Boolean))].map(id => cellStats(id, rows))
+  .sort((a, b) => (a.lastIRStart ?? Infinity) - (b.lastIRStart ?? Infinity) || b.lastMAh - a.lastMAh);
+
+/** Pairs with the closest IR (within 20 mΩ) and capacity (within 5 %), best matches first, each cell used once. */
+function cellPairs(cells) {
+  const ok = cells.filter(c => c.lastIRStart != null && c.lastMAh > 0), cand = [];
+  // ponytail: all-pairs O(n²) is instant for dozens of cells; a sorted sweep if it ever reaches thousands.
+  for (let a = 0; a < ok.length; a++) for (let b = a + 1; b < ok.length; b++) {
+    const dIR = Math.abs(ok[a].lastIRStart - ok[b].lastIRStart);
+    const dCap = Math.abs(ok[a].lastMAh - ok[b].lastMAh) / Math.max(ok[a].lastMAh, ok[b].lastMAh) * 100;
+    if (dIR <= 20 && dCap <= 5) cand.push({ score: dIR / 20 + dCap / 5, a, b, dIR, dCap });
+  }
+  const used = new Set(), out = [];
+  for (const c of cand.sort((x, y) => x.score - y.score)) {
+    if (used.has(c.a) || used.has(c.b)) continue;
+    used.add(c.a).add(c.b);
+    out.push({ a: ok[c.a], b: ok[c.b], dIR: c.dIR, dCap: c.dCap });
+  }
+  return out;
+}
+
+const csvField = v => { const t = String(v ?? "").replace(/\n/g, " "); return /[",]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+const csvLine = r => [r.date, csvField(r.charger), r.slot, csvField(r.cellID), csvField(r.chemistry), r.mAh,
+  r.irStart != null ? r.irStart.toFixed(1) : "", r.irEnd != null ? r.irEnd.toFixed(1) : "", r.seconds].join(",");
+function downloadCSV() {
+  const blob = new Blob([[CSV_HEADER, ...logRows.map(csvLine)].join("\n") + "\n"], { type: "text/csv" });
+  Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "cells.csv" }).click();
+}
+
+async function fetchLog() {
+  const r = await fetch("api/log", { cache: "no-store" }).catch(() => null);
+  if (r?.ok) { logRows = await r.json(); logFetched = Date.now(); }
+}
+
+function renderCells() {
+  const cells = allCells(), pairs = cellPairs(cells);
+  const paired = new Set(pairs.flatMap(p => [p.a.id, p.b.id])), alone = cells.filter(c => !paired.has(c.id)).map(c => esc(c.id));
+  const row = (k, v) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`;
+  $("cellsBody").innerHTML = `
+    <h3>Suggested pairs <small>IR within 20 mΩ, capacity within 5 %</small></h3>
+    ${pairs.length ? `<table>${pairs.map(p => row(`${esc(p.a.id)} + ${esc(p.b.id)}`, `IR ±${p.dIR.toFixed(0)} mΩ · capacity ±${p.dCap.toFixed(1)} %`)).join("")}</table>`
+      : `<p class="note" style="margin:0 0 12px">No matching pairs yet.</p>`}
+    ${pairs.length && alone.length ? `<p class="note" style="margin:0 0 12px">No match: ${alone.join(", ")}</p>` : ""}
+    <h3>Cells <small>lowest 1-min IR first</small></h3>
+    ${cells.length ? `<table>${cells.map(c => row(esc(c.id), `${mOhm(c.lastIRStart)} · ${c.lastMAh} mAh<br><small style="color:${c.drift != null ? driftColor(c.drift) : "var(--dim)"}">${
+        c.drift != null ? `${c.drift >= 0 ? "+" : ""}${c.drift.toFixed(0)} % vs baseline ${c.baseline.toFixed(0)} mΩ` : `baseline after 3 charges (${c.measured}/3)`}</small>`)).join("")}</table>`
+      : `<p class="note" style="margin:0 0 12px">Give a cell an ID in its slot's detail view. Every finished charge is logged and shows up here.</p>`}
+    <p>${hub ? `<a href="cells.csv" download>Download cells.csv</a> <small class="note">(the Mac's log)</small>`
+      : `<button type="button" id="csvBtn">Download cells.csv</button><br><small class="note" style="margin:0">This log is kept in this browser only: download it now and then to keep a copy.</small>`}</p>`;
+  $("csvBtn")?.addEventListener("click", downloadCSV);
+}
+
+$("cellInput").onchange = e => setCell(chargers.get(detailRef.id), detailRef.i, e.target.value);
+$("cellsBtn").onclick = async () => {
+  if (hub) await fetchLog();
+  renderCells();
+  $("cells").showModal();
+};
+
 // ---- Served by the Mac app: show its data, send changes to it (with the PIN) ----
 let hub = false;
 
@@ -472,13 +609,16 @@ async function hubRefresh() {
     const seen = new Set();
     for (const j of await r.json()) {
       seen.add(j.id);
-      Object.assign(chargers.get(j.id) || newCharger(j.id, j.name), j, { rejected: new Set(j.rejected) });
+      const { irStart = [], irEnd = [], ...rest } = j, ch = chargers.get(j.id) || newCharger(j.id, j.name);
+      Object.assign(ch, rest, { rejected: new Set(j.rejected) });
+      ch.tracks.forEach((t, i) => { t.irStart = irStart[i] ?? null; t.irEnd = irEnd[i] ?? null; });
     }
     for (const id of chargers.keys()) if (!seen.has(id)) chargers.delete(id);
     if ($("detail").open && chargers.has(detailRef.id)) {
       const h = await fetch(`api/history?id=${encodeURIComponent(detailRef.id)}&slot=${detailRef.i}`, { cache: "no-store" });
-      if (h.ok) chargers.get(detailRef.id).history[detailRef.i] = await h.json();
+      if (h.ok) chargers.get(detailRef.id).tracks[detailRef.i].history = await h.json();
     }
+    if (Date.now() - logFetched > 30000 || $("cells").open || $("detail").open) await fetchLog();
     $("note").className = "note";
     $("note").textContent = "Live from the A8 Chargers app on the Mac. Changing settings asks for the PIN shown at the bottom of the app.";
   } catch {
@@ -517,7 +657,7 @@ function startBluetooth() {
   render();
 }
 
-if (location.hash === "#demo") {
+if (demo) {
   // Packets recorded from the real chargers; also a quick check of the parsers.
   const hex = h => Uint8Array.from(h.match(/../g), x => parseInt(x, 16));
   const s = parseSlots(hex("31e708" + "00".repeat(14) + "04" + "00".repeat(10) + ("00".repeat(14) + "06" + "00".repeat(10)).repeat(3)
@@ -538,6 +678,32 @@ if (location.hash === "#demo") {
     onData(ch, hex("1900"));
     packets.forEach(p => onData(ch, hex(p)));
   }
+  // Cell tracking: same checks as CellLog.selfCheck() in the app.
+  const sl = (state, seconds, ir) => ({ ...blank(), state, seconds, mV: 1400, irRaw: ir });
+  const tr = { history: [], irStart: null, irEnd: null };
+  trackUpdate(tr, blank(), sl(3, 30, 900));
+  console.assert(tr.irStart === null, "no irStart before 60 s");
+  trackUpdate(tr, sl(3, 30, 900), sl(3, 62, 1200));
+  trackUpdate(tr, sl(3, 62, 1200), sl(3, 90, 1300));
+  console.assert(tr.irStart === 120, "irStart is the first reading at ≥ 60 s", tr);
+  console.assert(trackUpdate(tr, sl(3, 90, 1300), sl(6, 3600, 1500)) && tr.irEnd === 150, "finish logs irEnd", tr);
+  const late = { history: [], irStart: null, irEnd: null };
+  trackUpdate(late, blank(), sl(3, 1800, 1200));
+  console.assert(late.irStart === null, "joining a charge late records no irStart");
+  const rowsOf = (id, irs, mAh) => irs.map(v => ({ cellID: id, mAh, irStart: v }));
+  const ca = cellStats("A", rowsOf("A", [100, 120, 110, 160], 2400));
+  console.assert(ca.baseline === 110 && Math.abs(ca.drift - 45.45) < 0.01, "baseline = median of first 3, drift vs latest", ca);
+  const pr = cellPairs([ca, cellStats("B", rowsOf("B", [150], 2350)), cellStats("C", rowsOf("C", [300], 2400))]);
+  console.assert(pr.length === 1 && pr[0].a.id === "A" && pr[0].b.id === "B", "pairs within 20 mΩ and 5 %", pr);
+  console.assert(csvLine({ date: "d", charger: 'Car "1", left', slot: 3, cellID: "EP-07", chemistry: "NiMH", mAh: 2410, irStart: 118.5, irEnd: null, seconds: 7200 })
+    === 'd,"Car ""1"", left",3,EP-07,NiMH,2410,118.5,,7200', "CSV line");
+
+  // Labels and some logged charges, so the Cells view and drift colours have something to show.
+  chargers.get("demo-Cargador4").cells = ["EP-01", "EP-02", "EP-03", "EP-04", "EP-05", "EP-06", "EP-07", "EP-08"];
+  const seed = { "EP-01": [[150, 160, 155, 240], 2310], "EP-02": [[110, 112, 108, 115], 2480], "EP-03": [[120, 118, 122, 160], 2420],
+                 "EP-04": [[100, 105], 2500], "EP-05": [[112, 115, 113, 118], 2470], "EP-06": [[130, 128, 131, 133], 2400], "EP-07": [[140, 138, 142, 145], 2390] };
+  logRows = Object.entries(seed).flatMap(([id, [irs, mAh]]) => irs.map((v, k) => ({ date: `2026-10-0${k + 1} 10:00:00`, charger: "Cargador4",
+    slot: +id.slice(-1), cellID: id, chemistry: "NiMH", mAh: mAh - k * 5, irStart: v, irEnd: v + 15, seconds: 9000 })));
   $("note").textContent = "Demo: recorded data from Cargador1 and Cargador4. Remove #demo from the address to use your real chargers.";
   render();
 } else {
