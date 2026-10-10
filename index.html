@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A8 Chargers</title>
+<!--
+  ISDT A8 Air chargers over Web Bluetooth (Chrome / Edge only; Safari and iPhone browsers have no Web Bluetooth).
+  Same protocol as a8air.py and the A8 Chargers app. Two ways to use it:
+  - Served by the A8 Chargers Mac app (http://<mac>.local:8777): shows the Mac's live data in any browser, iPhone included.
+  - Standalone with Web Bluetooth: in this folder run  python3 -m http.server 8000  and open http://localhost:8000/a8air.html in Chrome.
+  Add #demo to the address to see recorded data without Bluetooth.
+-->
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #1c1d22; --card: #26272e; --text: #f2f2f5; --dim: #9a9aa5; --faint: #55565f; --line: #383942;
+    --accent: #2f7cf6; --red: #ff3b30; --blue: #0a84ff; --green: #30d158; --irred: #cc4040; --irbright: #ff1a1a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f2f2f6; --card: #fff; --text: #16161a; --dim: #6b6b75; --faint: #b8b8c0; --line: #e4e4ea; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.35 -apple-system, system-ui, sans-serif; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px 16px; background: var(--bg); }
+  header h1 { font-size: 20px; margin: 0 auto 0 0; }
+  button { font: inherit; border: 0; border-radius: 8px; padding: 7px 12px; background: var(--line); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  .note { margin: 0 16px 12px; color: var(--dim); }
+  .note.warn { color: #ff9f0a; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 660px), 1fr)); gap: 16px; padding: 0 16px 16px; }
+  .card { background: var(--card); border-radius: 16px; padding: 14px; }
+  .card.offline { opacity: .55; }
+  .head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
+  .offline .dot { background: #ff9f0a; }
+  .name { font-size: 18px; font-weight: 700; }
+  .rename { padding: 0 4px; background: none; color: var(--blue); }
+  .power, .foot { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .power { margin-left: auto; }
+  .foot { display: flex; gap: 12px; font-size: 12px; margin-top: 8px; }
+  .foot span:last-child { margin-left: auto; }
+  .rejected { color: var(--red); margin-top: 6px; }
+  .slots { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-top: 10px; }
+  .slot { text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; cursor: pointer; padding: 4px 0; border-radius: 8px; white-space: nowrap; overflow: hidden; }
+  .slot:hover { background: var(--line); }
+  .slot .n { font-size: 11px; font-weight: 700; color: var(--dim); }
+  .slot .pct { font-size: 16px; font-weight: 700; }
+  .slot .v { font-weight: 700; }
+  .slot hr { border: 0; border-top: 1px solid var(--line); margin: 4px 8px; }
+  .slot .pre { font-size: 11px; color: var(--dim); }
+  .nu { display: none; }
+  .summary { display: none; font-size: 11px; color: var(--dim); margin-top: 6px; }
+  .bat { position: relative; width: 30px; height: 54px; margin: 8px auto 4px; border: 2px solid var(--c); border-radius: 6px; transition: opacity .7s; }
+  .bat::before { content: ""; position: absolute; top: -6px; left: 50%; width: 12px; height: 4px; margin-left: -6px; background: var(--c); border-radius: 2px 2px 0 0; }
+  .bat i { position: absolute; left: 3px; right: 3px; bottom: 3px; height: calc((100% - 6px) * var(--lvl)); background: var(--c); border-radius: 3px; }
+  .bat b { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 14px; text-shadow: 0 0 3px #000; }
+  .dim .bat.full { opacity: .2; }  /* full batteries blink; the toggle lives on <body> so re-renders don't reset it */
+  @media (max-width: 640px) {  /* phones: all chargers on one screen */
+    main { gap: 8px; padding: 0 8px 8px; }
+    .card { padding: 8px; border-radius: 12px; }
+    .slot { font-size: 10px; }
+    .slot .pct { font-size: 11px; }
+    .bat { width: 20px; height: 36px; margin-top: 6px; }
+    .slot .mah, .slot hr, .slot .pre, .foot, .u { display: none; }
+    .nu { display: inline; }
+    .summary { display: block; }
+  }
+  dialog { background: var(--card); color: var(--text); border: 0; border-radius: 16px; padding: 18px; width: min(560px, 94vw); max-height: 90vh; }
+  dialog::backdrop { background: #0008; }
+  dialog h2 { margin: 0 0 12px; font-size: 18px; }
+  dialog table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+  dialog td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  dialog td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 0 0 12px; }
+  fieldset label { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; }
+  input, select { font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+  input[type=number] { width: 110px; }
+  .toggles { display: flex; gap: 4px; flex-wrap: wrap; }
+  .toggles label { padding: 0; }
+  .toggles input { display: none; }
+  .toggles span { display: inline-block; width: 34px; padding: 5px 0; text-align: center; border-radius: 6px; background: var(--line); cursor: pointer; }
+  .toggles input:checked + span { background: var(--accent); color: #fff; }
+  menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; margin: 12px 0 0; }
+  figure { margin: 0 0 10px; }
+  figcaption { font-size: 12px; color: var(--dim); display: flex; justify-content: space-between; }
+  figure svg { width: 100%; height: 90px; background: var(--bg); border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>A8 Chargers</h1>
+  <button id="add" class="primary">Add charger</button>
+  <button id="setSlots" disabled>Set slots…</button>
+</header>
+<p class="note" id="note">Tap <b>Add charger</b> and pick one charger from the list; repeat for each. The list shows Bluetooth names (like “0000A8Air C0C”), not your names. Quit ISD Link and the A8 Chargers app (Mac and iPhone) first: each charger takes one connection at a time.</p>
+<main id="grid"></main>
+<p class="note">Each slot: charge · volts · mA · mAh · IR mΩ, then its settings. Click a slot for everything.</p>
+
+<dialog id="detail"><div id="detailBody"></div><form method="dialog"><menu><button class="primary">Done</button></menu></form></dialog>
+
+<dialog id="bulk"><form method="dialog" id="bulkForm">
+  <h2>Set slots</h2>
+  <fieldset><legend>Chargers</legend><div id="bulkChargers"></div></fieldset>
+  <fieldset><legend>Slots</legend>
+    <div class="toggles" id="bulkSlots"></div>
+    <label><button type="button" id="allSlots">Select all / none</button></label>
+  </fieldset>
+  <fieldset><legend>Charge settings</legend>
+    <label>Chemistry <select id="chem"></select></label>
+    <label>Current, mA (0 = auto) <input id="cur" type="number" min="0" max="1000" step="50" value="500"></label>
+    <label id="cutRow"><span id="cutLabel">Cutoff, mV</span> <input id="cut" type="number"></label>
+    <label id="capRow">Capacity limit, mAh (0 = none) <input id="cap" type="number" min="0" step="100" value="0"></label>
+  </fieldset>
+  <p id="bulkSummary"></p>
+  <p class="note warn" style="margin: 0">⚠ The wrong chemistry can damage cells or start a fire. Check before applying.</p>
+  <menu><button value="cancel" formnovalidate>Cancel</button><button value="apply" id="apply" class="primary">Apply</button></menu>
+</form></dialog>
+
+<script>
+"use strict";
+// ---- Protocol (verified against real chargers, FW 2.2; same as a8air.py / Protocol.swift) ----
+const SVC = 0xaf00, AF01 = 0xaf01, AF02 = 0xaf02;
+// Sent in the bind handshake; the A8 Air accepts any ID (no pairing button). Same as the app.
+const CLIENT_ID = [0x42, 0x75, 0xfb, 0xe8, 0x70, 0x1f, 0x7e, 0x71, 0x3a, 0x56, 0x17, 0x5f, 0x0b, 0x46, 0x85, 0x85];
+// Ranges ISD Link allows. NiMH cutoff is the −ΔV in mV; capacity limit 0 = none.
+const CHEM = [
+  { name: "LiHV", cut: [4250, 4450], def: 4350, cap: [2000, 7000] },
+  { name: "Li-ion", cut: [4100, 4300], def: 4200, cap: [2000, 7000] },
+  { name: "LiFe", cut: [3550, 3750], def: 3650, cap: [2000, 7000] },
+  { name: "NiZn", cut: [1800, 2000], def: 1900, cap: [2000, 7000] },
+  { name: "NiMH", cut: [3, 12], def: 4, cap: [1000, 4000] },
+  { name: "Li-ion 1.5V", cut: [0, 0], def: 0, cap: [1000, 4000] },
+  { name: "Auto", cut: [0, 0], def: 0, cap: [0, 0] },
+];
+const NIMH = 4;
+const STATES = ["Idle", "Pre-charge", "CC", "Charging", "CV", "Error", "Done"];
+
+const le = (b, i, n) => { let v = 0; for (let k = n - 1; k >= 0; k--) v = v * 256 + b[i + k]; return v; };
+const bytesLE = (v, n) => Array.from({ length: n }, (_, k) => Math.floor(v / 256 ** k) & 255);
+
+/** 31 E7 n, then 25 bytes per slot. */
+function parseSlots(p) {
+  const n = p[2];
+  if (p.length < 3 + n * 25) return null;
+  return Array.from({ length: n }, (_, i) => {
+    const o = 3 + i * 25;
+    return { state: p[o], percent: p[o + 1], mAh: le(p, o + 2, 4), mWh: le(p, o + 6, 4), seconds: Math.floor(le(p, o + 10, 4) / 1000),
+             chem: p[o + 14], mA: le(p, o + 15, 4), mV: le(p, o + 19, 2), irRaw: le(p, o + 21, 2), error: le(p, o + 23, 2) };
+  });
+}
+/** 31 ED n, then 12 bytes per slot. */
+function parseTasks(p) {
+  const n = p[2];
+  if (p.length < 3 + n * 12) return null;
+  return Array.from({ length: n }, (_, i) => {
+    const o = 3 + i * 12;
+    return { task: p[o], chem: p[o + 1], mA: le(p, o + 2, 4), cutoff: le(p, o + 6, 2), cap: le(p, o + 8, 4) };
+  });
+}
+/** 13 EA channel task=charge chemistry link=0 current(4) cells=auto cutoff(2) cap(4). */
+const workTask = (channel, t) => [0x13, 0xea, channel, 0, t.chem, 0, ...bytesLE(t.mA, 4), 0, ...bytesLE(t.cutoff, 2), ...bytesLE(t.cap, 4)];
+const taskValid = t => {
+  const c = CHEM[t.chem];
+  return !!c && (t.mA === 0 || (t.mA >= 100 && t.mA <= 1000)) && t.cutoff >= c.cut[0] && t.cutoff <= c.cut[1]
+    && (t.cap === 0 || (t.cap >= c.cap[0] && t.cap <= c.cap[1]));
+};
+
+// ---- Display rules (same as the app) ----
+const isEmpty = s => s.state === 0 && s.mV === 0;
+const isCharging = s => s.state >= 1 && s.state <= 4;
+const hasError = s => s.error !== 0 || s.state === 5;
+const level = s => isEmpty(s) ? 0 : s.state === 6 ? 100 : Math.min(Math.max(s.percent, 0), 100);  // finished counts as full
+/** Under 50 % red, 50–79 % blue, 80 % and up green, deepening as it fills. */
+function slotColor(s) {
+  if (isEmpty(s)) return "var(--faint)";
+  if (hasError(s) || level(s) < 50) return "var(--red)";
+  if (level(s) < 80) return "var(--blue)";
+  const t = (level(s) - 80) / 20;
+  return `hsl(130 ${60 + 40 * t}% ${68 - 28 * t}%)`;
+}
+/** IR bands: under 200 mΩ green, under 300 blue, under 400 red, 400 and up bright red. */
+function irColor(s) {
+  if (s.irRaw === 0) return "var(--dim)";
+  const ir = s.irRaw / 10;  // 0.1 mΩ units
+  return ir < 200 ? "var(--green)" : ir < 300 ? "var(--blue)" : ir < 400 ? "var(--irred)" : "var(--irbright)";
+}
+const chemName = c => CHEM[c]?.name ?? `Type ${c}`;
+const volts = mV => (mV / 1000).toFixed(2) + " V";
+const currentLabel = mA => mA === 0 ? "Auto current" : `${mA} mA`;
+const cutoffLabel = t => t.cutoff === 0 ? "Auto cutoff" : t.chem === NIMH ? `−ΔV ${t.cutoff} mV` : volts(t.cutoff);
+const capLabel = t => t.cap === 0 ? "No cap" : `Cap ${t.cap} mAh`;
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+// ---- Chargers ----
+const chargers = new Map();  // device id -> charger
+const blank = () => ({ state: 0, percent: 0, mAh: 0, mWh: 0, seconds: 0, chem: 6, mA: 0, mV: 0, irRaw: 0, error: 0 });
+
+function newCharger(id, name) {
+  const ch = { id, name, online: false, status: "Connecting…", fw: "", inMV: 0, inMA: 0,
+               slots: Array.from({ length: 8 }, blank), tasks: Array.from({ length: 8 }, () => ({ task: 0, chem: 6, mA: 0, cutoff: 0, cap: 0 })),
+               history: Array.from({ length: 8 }, () => []), rejected: new Set(), queue: Promise.resolve() };
+  chargers.set(id, ch);
+  return ch;
+}
+
+function send(ch, char, bytes) {
+  // These characteristics only accept write-with-response; Apple's Bluetooth stack silently drops the other kind.
+  if (!char) return;
+  ch.queue = ch.queue.then(() => char.writeValueWithResponse(new Uint8Array(bytes))).catch(() => {});
+}
+
+function poll(ch) {
+  send(ch, ch.af01, [0x13, 0xe6, 0x00]);  // all 8 slots
+  send(ch, ch.af01, [0x12, 0xe4, 0x00]);  // input voltage / current
+  send(ch, ch.af01, [0x12, 0xec, 0x00]);  // slot settings
+}
+
+function onData(ch, b) {
+  if (b[0] === 0x19) {  // bind reply
+    if (b[1] === 0) { ch.online = true; ch.status = ""; send(ch, ch.af02, [0xe0]); poll(ch); }
+    else ch.status = "Charger refused the connection";
+  } else if (b[0] === 0xe1 && b.length >= 5) {
+    ch.fw = `HW ${b[1]}.${b[2]} · FW ${b[3]}.${b[4]}`;
+  } else if (b[0] === 0x31) {
+    switch (b[1]) {
+      case 0xe5: if (b.length >= 9) { ch.inMV = le(b, 3, 2); ch.inMA = le(b, 5, 4); } break;
+      case 0xe7: { const s = parseSlots(b); if (s?.length === 8) updateSlots(ch, s); } break;
+      case 0xed: { const t = parseTasks(b); if (t?.length === 8) ch.tasks = t; } break;
+      case 0xeb: if (b.length >= 4 && b[3] !== 0) ch.rejected.add(b[2] + 1); break;
+      case 0xc1:
+        if (b[2] === 0 && ch.pendingName) { ch.name = ch.pendingName; saveName(ch); } else if (b[2] !== 0) ch.status = "Rename refused";
+        ch.pendingName = null;
+        break;
+    }
+  }
+  scheduleRender();
+}
+
+function updateSlots(ch, slots) {
+  slots.forEach((s, i) => {
+    if (!isCharging(s)) return;
+    const h = ch.history[i], last = h.at(-1);
+    if (last && s.seconds < last.s) h.length = 0;  // a new charge started
+    // ponytail: one point per 10 s keeps a 10 h charge at ~3600 points.
+    if (!h.length || s.seconds - h.at(-1).s >= 10) h.push({ s: s.seconds, v: s.mV / 1000, ma: s.mA, mah: s.mAh });
+  });
+  ch.slots = slots;
+}
+
+const saveName = ch => { try { localStorage.setItem("name:" + ch.id, ch.name); } catch {} };
+const loadName = id => { try { return localStorage.getItem("name:" + id); } catch { return null; } };
+
+// ---- Web Bluetooth ----
+async function attach(device) {
+  if (chargers.has(device.id)) return;
+  const ch = newCharger(device.id, loadName(device.id) || (device.name || "A8 Air").replace(/\s+/g, " ").trim());
+  ch.device = device;
+  device.addEventListener("gattserverdisconnected", () => {
+    ch.online = false; ch.status = "Offline, reconnecting…"; scheduleRender();
+    setTimeout(() => connect(ch), 2000);
+  });
+  scheduleRender();
+  await readName(ch);
+  connect(ch);
+}
+
+/** The name set in ISD Link is only in the advertisement (manufacturer data after the model bytes). */
+async function readName(ch) {
+  if (!ch.device.watchAdvertisements) return;
+  const stop = new AbortController();
+  try {
+    const got = new Promise(resolve => ch.device.addEventListener("advertisementreceived", e => {
+      const d = e.manufacturerData.get(0xabba);
+      if (d) {
+        const b = new Uint8Array(d.buffer, d.byteOffset, d.byteLength), end = b.indexOf(0, 6);
+        const name = new TextDecoder().decode(b.slice(6, end < 0 ? undefined : end));
+        if (name) { ch.name = name; saveName(ch); scheduleRender(); }
+      }
+      resolve();
+    }, { once: true }));
+    await ch.device.watchAdvertisements({ signal: stop.signal });
+    await Promise.race([got, new Promise(r => setTimeout(r, 4000))]);
+  } catch {} finally { stop.abort(); }
+}
+
+async function connect(ch) {
+  if (ch.device.gatt.connected) return;
+  try {
+    const svc = await (await ch.device.gatt.connect()).getPrimaryService(SVC);
+    ch.af01 = await svc.getCharacteristic(AF01);
+    ch.af02 = await svc.getCharacteristic(AF02);
+    for (const c of [ch.af01, ch.af02]) {
+      c.oncharacteristicvaluechanged = e => onData(ch, new Uint8Array(e.target.value.buffer, e.target.value.byteOffset, e.target.value.byteLength));
+      await c.startNotifications();
+    }
+    ch.queue = Promise.resolve();
+    send(ch, ch.af02, [0x18, ...CLIENT_ID, 0x00, 0x01]);
+  } catch (e) {
+    ch.status = "Can't reach it, retrying…";
+    scheduleRender();
+    setTimeout(() => connect(ch), 5000);
+  }
+}
+
+// Either filter may match (they're OR'ed). The name filter is the backup for iPhone Bluetooth browsers
+// whose manufacturer-data filter doesn't work (reported for Bluefy). A8 Airs advertise as "0000A8Air   Cxx".
+const byModel = { manufacturerData: [{ companyIdentifier: 0xabba, dataPrefix: new Uint8Array([0, 0, 0x01, 0x0f, 0x00, 0xa8]),
+                                       mask: new Uint8Array([0, 0, 0xff, 0xff, 0xff, 0xff]) }] };  // ISDT, model 01 0F 00 A8
+const byName = { namePrefix: "0000A8Air" };
+
+document.getElementById("add").onclick = async () => {
+  let device;
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [byModel, byName], optionalServices: [SVC] });
+  } catch (e) {
+    if (e.name !== "TypeError") return;  // picker cancelled
+    // This browser rejects the manufacturer-data filter outright: search by name only.
+    try { device = await navigator.bluetooth.requestDevice({ filters: [byName], optionalServices: [SVC] }); } catch { return; }
+  }
+  attach(device);
+};
+
+// ---- Rendering ----
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(); });
+}
+
+function slotHTML(ch, i) {
+  const s = ch.slots[i], t = ch.tasks[i], c = slotColor(s), lvl = level(s);
+  const sym = hasError(s) ? "!" : isCharging(s) ? "⚡" : "";
+  const live = isEmpty(s)
+    ? `<div class="pct" style="color:var(--dim)"><span class="u">Empty</span><span class="nu">–</span></div><div>&nbsp;</div><div>&nbsp;</div><div class="mah">&nbsp;</div><div>&nbsp;</div>`
+    : `<div class="pct" style="color:${c}">${lvl}%</div><div class="v">${(s.mV / 1000).toFixed(2)}<span class="u"> V</span></div>
+       <div>${s.mA}<span class="u"> mA</span></div><div class="mah">${s.mAh} mAh</div>
+       <div style="color:${irColor(s)};font-weight:${s.irRaw >= 3000 ? 700 : 400}">${s.irRaw ? (s.irRaw / 10).toFixed(0) : "–"}<span class="u"> mΩ</span></div>`;
+  return `<div class="slot" data-ch="${esc(ch.id)}" data-i="${i}"><div class="n">${i + 1}</div>
+    <div class="bat${lvl === 100 ? " full" : ""}" style="--c:${c};--lvl:${lvl / 100}"><i></i><b>${sym}</b></div>${live}
+    <hr><div class="pre"><b>${chemName(t.chem)}</b><br>${currentLabel(t.mA)}<br>${cutoffLabel(t)}<br>${capLabel(t)}</div></div>`;
+}
+
+function render() {
+  const list = [...chargers.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  document.getElementById("grid").innerHTML = list.map(ch => {
+    const v = ch.inMV / 1000, a = ch.inMA / 1000, same = ch.tasks.every(t => JSON.stringify(t) === JSON.stringify(ch.tasks[0])), t = ch.tasks[0];
+    return `<section class="card${ch.online ? "" : " offline"}">
+      <div class="head"><span class="dot"></span><span class="name">${esc(ch.name)}</span>
+        <button class="rename" data-rename="${esc(ch.id)}" title="Rename" ${ch.online ? "" : "disabled"}>✎</button>
+        ${/^(ISDT BLE DEVICE|A8 Air)$/i.test(ch.name) ? `<span class="power" style="margin-left:0">← Chrome can't see this charger's name: click ✎ and type it once</span>` : ""}
+        <span class="power">${ch.online ? `🔌 ${v.toFixed(2)} V · ${a.toFixed(2)} A · ${(v * a).toFixed(1)} W` : esc(ch.status)}</span></div>
+      <div class="slots">${ch.slots.map((_, i) => slotHTML(ch, i)).join("")}</div>
+      <div class="summary">${same ? `All slots: ${chemName(t.chem)} · ${currentLabel(t.mA)} · ${cutoffLabel(t)} · ${capLabel(t)}` : "Slots have different settings. Tap a slot to see its own."}</div>
+      <div class="foot"><span>${ch.fw}</span><span>Charged ${ch.slots.reduce((n, s) => n + s.mAh, 0)} mAh</span></div>
+      ${ch.rejected.size ? `<div class="rejected">Charger rejected slots ${[...ch.rejected].sort().join(", ")}</div>` : ""}
+    </section>`;
+  }).join("");
+  document.getElementById("setSlots").disabled = !list.some(ch => ch.online);
+  if (document.getElementById("detail").open) renderDetail();
+}
+
+// ---- Slot detail ----
+let detailRef = null;
+function graph(title, h, key, color, digits) {
+  const ys = h.map(p => p[key]), lo = Math.min(...ys), hi = Math.max(...ys), x0 = h[0].s, x1 = h.at(-1).s;
+  const pts = h.map(p => `${((p.s - x0) / (x1 - x0 || 1) * 300).toFixed(1)},${(100 - (p[key] - lo) / (hi - lo || 1) * 100).toFixed(1)}`).join(" ");
+  return `<figure><figcaption><span>${title}</span><span>${lo.toFixed(digits)} – ${hi.toFixed(digits)} · ${((x1 - x0) / 60).toFixed(0)} min</span></figcaption>
+    <svg viewBox="0 -4 300 108" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></figure>`;
+}
+function renderDetail() {
+  const ch = chargers.get(detailRef.id), i = detailRef.i, s = ch.slots[i], t = ch.tasks[i], h = ch.history[i];
+  const time = new Date(s.seconds * 1000).toISOString().slice(11, 19);
+  const rows = [["State", isEmpty(s) ? "Empty" : STATES[s.state] ?? `State ${s.state}`], ["Chemistry", chemName(s.chem)],
+    ["Voltage", (s.mV / 1000).toFixed(3) + " V"], ["Current", s.mA + " mA"], ["Charged", `${s.mAh} mAh · ${s.mWh} mWh`],
+    ["Charge level", `<span style="color:${slotColor(s)}">${level(s)} %</span>`], ["Time", time],
+    ["Internal resistance", `<span style="color:${irColor(s)}">${(s.irRaw / 10).toFixed(1)} mΩ</span>`], ["Error code", s.error],
+    ["Preset chemistry", chemName(t.chem)], ["Preset current", currentLabel(t.mA)], ["Preset cutoff", cutoffLabel(t)], ["Capacity limit", capLabel(t)]];
+  document.getElementById("detailBody").innerHTML = `<h2>${esc(ch.name)} · slot ${i + 1}</h2>
+    <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</table>
+    ${h.length < 2 ? `<p class="note" style="margin:0">Graphs fill in while this page is open and the slot is charging.</p>`
+      : graph("Voltage (V)", h, "v", "var(--green)", 3) + graph("Current (mA)", h, "ma", "#ff9f0a", 0) + graph("Charged (mAh)", h, "mah", "var(--blue)", 0)}`;
+}
+
+document.getElementById("grid").onclick = e => {
+  const rn = e.target.closest("[data-rename]");
+  if (rn) return renameCharger(chargers.get(rn.dataset.rename));
+  const slot = e.target.closest(".slot");
+  if (!slot) return;
+  detailRef = { id: slot.dataset.ch, i: +slot.dataset.i };
+  renderDetail();
+  document.getElementById("detail").showModal();
+  if (hub) hubRefresh();  // fetch this slot's graph data now
+};
+
+/** Same command ISD Link sends: 12 C0 + name padded to 14 bytes. The charger replies 31 C1 00, then reconnects. */
+function renameCharger(ch) {
+  const name = prompt(`Rename ${ch.name} (up to 14 characters)`, ch.name)?.trim();
+  if (!name) return;
+  const bytes = [...new TextEncoder().encode(name)];
+  if (bytes.length > 14) return alert("That name is too long: 14 characters at most.");
+  if (hub) return hubPost("api/rename", { id: ch.id, name });
+  ch.pendingName = name;
+  send(ch, ch.af01, [0x12, 0xc0, ...bytes, ...Array(14 - bytes.length).fill(0)]);
+}
+
+// ---- Bulk set ----
+const $ = id => document.getElementById(id);
+$("chem").innerHTML = CHEM.map((c, i) => `<option value="${i}"${i === NIMH ? " selected" : ""}>${c.name}</option>`).join("");
+$("bulkSlots").innerHTML = Array.from({ length: 8 }, (_, i) => `<label><input type="checkbox" value="${i + 1}" checked><span>${i + 1}</span></label>`).join("");
+
+function bulkTask() {
+  return { task: 0, chem: +$("chem").value, mA: +$("cur").value || 0, cutoff: CHEM[+$("chem").value].cut[1] ? +$("cut").value : 0, cap: +$("cap").value || 0 };
+}
+const pickedChargers = () => [...$("bulkChargers").querySelectorAll("input:checked")].map(x => chargers.get(x.value)).filter(Boolean);
+const pickedSlots = () => [...$("bulkSlots").querySelectorAll("input:checked")].map(x => +x.value);
+
+function onChemChange() {
+  const c = CHEM[+$("chem").value];
+  $("cutRow").hidden = !c.cut[1];
+  $("cut").min = c.cut[0]; $("cut").max = c.cut[1]; $("cut").value = c.def;
+  $("cutLabel").textContent = $("chem").value == NIMH ? "−ΔV cutoff, mV (3–12)" : `Cutoff, mV (${c.cut[0]}–${c.cut[1]})`;
+  $("capRow").hidden = !c.cap[1];
+  $("cap").value = 0;
+  onBulkInput();
+}
+function onBulkInput() {
+  const t = bulkTask(), chs = pickedChargers(), slots = pickedSlots(), ok = taskValid(t) && chs.length && slots.length;
+  $("apply").disabled = !ok;
+  $("bulkSummary").textContent = taskValid(t)
+    ? `Sets ${slots.length} slot(s) on ${chs.length} charger(s) to ${chemName(t.chem)}, ${currentLabel(t.mA)}, ${cutoffLabel(t)}, ${capLabel(t)}.`
+    : "Current must be 0 (auto) or 100–1000 mA, and cutoff / capacity limit within the ranges shown.";
+}
+$("chem").onchange = onChemChange;
+$("bulkForm").oninput = onBulkInput;
+$("allSlots").onclick = () => {
+  const boxes = [...$("bulkSlots").querySelectorAll("input")], all = boxes.every(b => b.checked);
+  boxes.forEach(b => b.checked = !all);
+  onBulkInput();
+};
+$("setSlots").onclick = () => {
+  $("bulkChargers").innerHTML = [...chargers.values()].filter(ch => ch.online)
+    .map(ch => `<label>${esc(ch.name)} <input type="checkbox" value="${esc(ch.id)}" checked></label>`).join("");
+  onChemChange();
+  $("bulk").showModal();
+};
+$("bulk").onclose = () => {
+  if ($("bulk").returnValue !== "apply") return;
+  const t = bulkTask();
+  if (!taskValid(t)) return;
+  if (hub) return hubPost("api/set", { chargers: pickedChargers().map(ch => ch.id), slots: pickedSlots(), task: t });
+  for (const ch of pickedChargers()) {
+    if (!ch.online) continue;
+    ch.rejected.clear();
+    for (const slot of pickedSlots()) send(ch, ch.af01, workTask(slot - 1, t));
+    poll(ch);
+  }
+};
+
+// ---- Start ----
+setInterval(() => document.body.classList.toggle("dim"), 800);
+
+// ---- Served by the Mac app: show its data, send changes to it (with the PIN) ----
+let hub = false;
+
+async function hubRefresh() {
+  try {
+    const r = await fetch("api/state", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    const seen = new Set();
+    for (const j of await r.json()) {
+      seen.add(j.id);
+      Object.assign(chargers.get(j.id) || newCharger(j.id, j.name), j, { rejected: new Set(j.rejected) });
+    }
+    for (const id of chargers.keys()) if (!seen.has(id)) chargers.delete(id);
+    if ($("detail").open && chargers.has(detailRef.id)) {
+      const h = await fetch(`api/history?id=${encodeURIComponent(detailRef.id)}&slot=${detailRef.i}`, { cache: "no-store" });
+      if (h.ok) chargers.get(detailRef.id).history[detailRef.i] = await h.json();
+    }
+    $("note").className = "note";
+    $("note").textContent = "Live from the A8 Chargers app on the Mac. Changing settings asks for the PIN shown at the bottom of the app.";
+  } catch {
+    $("note").className = "note warn";
+    $("note").textContent = "Can't reach the Mac. Is the A8 Chargers app open and the Mac awake?";
+  }
+  render();
+}
+
+async function hubPost(path, body) {
+  let pin = null;
+  try { pin = localStorage.getItem("pin"); } catch {}
+  pin = pin || prompt("PIN shown at the bottom of the A8 Chargers app on the Mac")?.trim();
+  if (!pin) return;
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-PIN": pin }, body: JSON.stringify(body) }).catch(() => null);
+  if (r?.ok) {
+    try { localStorage.setItem("pin", pin); } catch {}
+    return hubRefresh();
+  }
+  if (r?.status === 403) try { localStorage.removeItem("pin"); } catch {}
+  alert(r ? await r.text() : "Can't reach the Mac.");
+}
+
+function startBluetooth() {
+  setInterval(() => chargers.forEach(ch => ch.online && poll(ch)), 2000);
+  if (!navigator.bluetooth) {
+    $("note").className = "note warn";
+    $("note").textContent = /iPhone|iPad/.test(navigator.userAgent)
+      ? "This browser can't use Bluetooth. On iPhone, open this page in Safari with the free beacio extension turned on (Safari page menu → Manage Extensions → beacio, then Allow on Every Website), or in the Bluefy browser. Chrome on iPhone can't do it."
+      : "This browser can't use Bluetooth. Use Chrome or Edge on a Mac, Windows PC or Android phone, or open the page from the A8 Chargers app on the Mac (address at the bottom of the app).";
+    $("add").disabled = true;
+  } else {
+    // Chargers allowed before reconnect by themselves where Chrome remembers the permission.
+    navigator.bluetooth.getDevices?.().then(list => list.forEach(attach)).catch(() => {});
+  }
+  render();
+}
+
+if (location.hash === "#demo") {
+  // Packets recorded from the real chargers; also a quick check of the parsers.
+  const hex = h => Uint8Array.from(h.match(/../g), x => parseInt(x, 16));
+  const s = parseSlots(hex("31e708" + "00".repeat(14) + "04" + "00".repeat(10) + ("00".repeat(14) + "06" + "00".repeat(10)).repeat(3)
+    + "035a440000006a0000001407080004fd010000dd05d3040000" + "035a430000006b0000001407080004f7010000ea0513070000" + ("00".repeat(14) + "06" + "00".repeat(10)).repeat(2)));
+  console.assert(s[4].mA === 509 && s[4].mV === 1501 && s[4].irRaw === 1235 && s[4].mAh === 68 && s[4].state === 3, "parseSlots", s[4]);
+  console.assert(workTask(0, { chem: 4, mA: 500, cutoff: 5, cap: 0 }).map(x => x.toString(16).padStart(2, "0")).join("")
+    === "13ea00000400f4010000000500" + "00000000", "workTask");
+  const demo = {
+    Cargador1: ["e1010002024138416972202020", "31e5082e2f6c010000",
+      "31e708033c1d000000300000007492030004fb0100009105cf10000003461d000000320000007492030004f5010000ac050014000003361c000000370000007492030004ed0100008405e52200000000000000000000000000000000040000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000400000000000000000000",
+      "31ed080004f40100000500000000000004f40100000500000000000004f40100000500000000000004f40100000500000000000004f40100000500000000000004f40100000500000000000004f4010000050000000000000400000000050000000000"],
+    Cargador4: ["e1010002024138416972202020", "31e508c82238030000",
+      "31e708030a0f00000020000000d482030004c60000007b05f75d0000030a110000001e000000d4820300041b01000066059c2e0000030a0f00000020000000d482030004e20000007105574b0000030a0e0000001f000000d482030004cb0000008a05145d0000030a1c00000029000000d482030004f2010000730514050000030a1c0000002a000000d482030004fe0100007b05bc040000030a1c0000002c000000d482030004ed0100007205030d0000030a1c00000028000000d482030004ee010000660509030000",
+      "31ed08000400000000000000000000000400000000000000000000000400000000000000000000000400000000000000000000000400000000000000000000000400000000000000000000000400000000000000000000000400000000000000000000"],
+  };
+  for (const [name, packets] of Object.entries(demo)) {
+    const ch = newCharger("demo-" + name, name);
+    onData(ch, hex("1900"));
+    packets.forEach(p => onData(ch, hex(p)));
+  }
+  $("note").textContent = "Demo: recorded data from Cargador1 and Cargador4. Remove #demo from the address to use your real chargers.";
+  render();
+} else {
+  fetch("api/state", { cache: "no-store" }).then(r => r.ok ? r.json() : Promise.reject())
+    .then(() => { hub = true; $("add").hidden = true; hubRefresh(); setInterval(hubRefresh, 2000); })
+    .catch(startBluetooth);
+}
+</script>
+</body>
+</html>
